@@ -9,9 +9,14 @@
 #
 # THE STATUS LINE (two lines, grouped by the question you're asking):
 #   line 1 — identity:  model + effort  │  repo (+PR)  │  session
-#   line 2 — gauges:    context bar      │  5h limit    │  7d limit
+#   line 2 — gauges:    context bar  │  5h limit  │  7d limit  │  extra: used/limit
 #   Percentages stay muted until elevated, then turn amber (>=60%) / coral (>=85%).
 #   Segments with no data are omitted; if line 2 is empty it collapses to one line.
+#
+# NOTE: "extra:" (pay-as-you-go credits) is NOT in the status-line stdin, so it
+#   is fetched from Anthropic's OAuth usage endpoint using your Claude Code
+#   credentials and cached (~2 min, refreshed in the background). If no token is
+#   found or the endpoint is unavailable, that segment is simply omitted.
 #
 # HOW TO RUN IT:
 #   Hand this file to Claude Code and say: "run this file to set up my status line".
@@ -189,7 +194,7 @@ if [ -n "$five_pct" ] || [ -n "$week_pct" ]; then
     if [ -n "$week_pct" ]; then
         week_int=$(printf "%.0f" "$week_pct")
         rc=$(pct_color "$week_int")
-        [ -n "$rate_pieces" ] && rate_pieces="${rate_pieces}  "
+        [ -n "$rate_pieces" ] && rate_pieces="${rate_pieces}${SEP}"
         rate_pieces="${rate_pieces}${C_MUTED}7d ${RESET}${rc}${week_int}%${RESET}"
         if [ -n "$week_resets" ]; then
             now=$(date +%s)
@@ -202,6 +207,71 @@ if [ -n "$five_pct" ] || [ -n "$week_pct" ]; then
         fi
     fi
     rate_part="$rate_pieces"
+fi
+
+# ── 7. EXTRA USAGE / CREDITS (pay-as-you-go) ─────────────────────────────────
+# This is NOT in the status-line stdin, so we fetch it from the OAuth usage
+# endpoint (same one Claude Code uses) and cache it with a background refresh.
+# Silently shows nothing if there's no token or the endpoint is unavailable.
+extra_part=""
+XU_CACHE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/cache"
+XU_CACHE="$XU_CACHE_DIR/statusline-extra-usage.json"
+XU_TTL=120
+mkdir -p "$XU_CACHE_DIR" 2>/dev/null
+
+xu_token() {
+    [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && { printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN"; return; }
+    local r=""
+    command -v security >/dev/null 2>&1 && \
+        r=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+    if [ -z "$r" ]; then
+        local cf="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+        [ -f "$cf" ] && r=$(cat "$cf" 2>/dev/null)
+    fi
+    [ -z "$r" ] && command -v secret-tool >/dev/null 2>&1 && \
+        r=$(secret-tool lookup service "Claude Code-credentials" 2>/dev/null)
+    printf '%s' "$r" | node -e 'let d="";process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{const o=JSON.parse(d);process.stdout.write(String((o.claudeAiOauth&&o.claudeAiOauth.accessToken)||o.accessToken||""))}catch(e){}})' 2>/dev/null
+}
+xu_fetch() {
+    local t; t=$(xu_token); [ -z "$t" ] && return 1
+    curl -s --max-time 5 \
+        -H "Accept: application/json" -H "Authorization: Bearer $t" \
+        -H "anthropic-beta: oauth-2025-04-20" -H "User-Agent: claude-code/statusline" \
+        "https://api.anthropic.com/api/oauth/usage"
+}
+
+xu_age=999999
+if [ -f "$XU_CACHE" ]; then
+    xu_mtime=$(stat -f %m "$XU_CACHE" 2>/dev/null || stat -c %Y "$XU_CACHE" 2>/dev/null || echo 0)
+    xu_age=$(( $(date +%s) - xu_mtime ))
+fi
+if [ "$xu_age" -ge "$XU_TTL" ]; then
+    if [ -f "$XU_CACHE" ]; then
+        # stale: refresh in background (unique tmp + atomic mv, no lock), render stale now
+        ( o=$(xu_fetch 2>/dev/null); [ -n "$o" ] && printf '%s' "$o" > "$XU_CACHE.$$" && mv "$XU_CACHE.$$" "$XU_CACHE"; ) >/dev/null 2>&1 &
+    else
+        # nothing cached: one synchronous fetch so the first render has data
+        o=$(xu_fetch 2>/dev/null); [ -n "$o" ] && printf '%s' "$o" > "$XU_CACHE"
+    fi
+fi
+
+if [ -s "$XU_CACHE" ]; then
+    xu_str=$(node -e '
+      const fs=require("fs");
+      try{
+        const o=(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).extra_usage)||{};
+        if(!o.is_enabled) process.exit(0);
+        const sym={USD:"$",EUR:"€",GBP:"£",JPY:"¥"}[o.currency]||((o.currency||"")+" ");
+        const dp=(o.decimal_places!=null)?o.decimal_places:2;
+        const used=(o.used_credits!=null)?Number(o.used_credits).toFixed(dp):null;
+        const lim=(o.monthly_limit!=null)?Number(o.monthly_limit).toFixed(dp):null;
+        if(used==null && lim==null) process.exit(0);
+        let s=sym+(used!=null?used:"0");
+        if(lim!=null) s+="/"+sym+lim;
+        process.stdout.write(s);
+      }catch(e){}
+    ' "$XU_CACHE" 2>/dev/null)
+    [ -n "$xu_str" ] && extra_part="${C_MUTED}extra: ${RESET}${C_VALUE}${xu_str}${RESET}"
 fi
 
 # ── ASSEMBLE (two lines: identity on top, resource gauges below) ─────────────
@@ -222,8 +292,8 @@ location_group="$location_part"
 [ -n "$pr_part" ] && location_group="${location_group:+$location_group }${pr_part}"
 line1=$(join_sep "$model_part" "$location_group" "$session_part")
 
-# Line 2 — gauges: context window · rate limits
-line2=$(join_sep "$ctx_part" "$rate_part")
+# Line 2 — gauges: context window · rate limits · extra usage (far right)
+line2=$(join_sep "$ctx_part" "$rate_part" "$extra_part")
 
 if [ -n "$line2" ]; then
     printf "%b\n%b\n" "$line1" "$line2"
