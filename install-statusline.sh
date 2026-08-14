@@ -8,7 +8,7 @@
 #      MERGING into any existing settings (a timestamped .bak backup is made first).
 #
 # THE STATUS LINE (two lines, grouped by the question you're asking):
-#   line 1 — identity:  model + effort  │  repo (+PR)  │  session
+#   line 1 — identity:  model + effort  │  repo[/worktree] (+PR)  │  session
 #   line 2 — gauges:    context bar  │  5h limit  │  7d limit  │  extra: used/limit
 #   Percentages stay muted until elevated, then turn amber (>=60%) / coral (>=85%).
 #   Segments with no data are omitted; if line 2 is empty it collapses to one line.
@@ -51,7 +51,8 @@ C_BAR_CRIT="\033[38;5;210m"   # soft coral      — bar fill, high usage
 C_BAR_EMPTY="\033[38;5;240m"  # dark gray       — empty bar cells
 C_VALUE="\033[97m"             # bright white    — primary values
 C_MUTED="\033[38;5;242m"      # dim gray        — secondary / token counts
-C_LOCATION="\033[38;5;110m"   # muted sky blue  — repo / dir name
+C_LOCATION="\033[38;5;110m"   # muted sky blue  — repo / dir name (or worktree)
+C_LOC_PARENT="\033[38;5;66m"  # desaturated sky — parent repo, when in a worktree
 C_SESSION="\033[38;5;252m"    # near-white      — session name
 C_OK="\033[38;5;150m"         # sage green      — PR approved
 C_WARN="\033[38;5;221m"       # golden yellow   — open PR, mid rate limit
@@ -133,19 +134,32 @@ if [ -n "$used_pct" ]; then
 fi
 
 # ── 3. LOCATION (repo name only — no owner prefix) ───────────────────────────
+# Rendered as repo/worktree when cwd is in a linked worktree. The BRIGHT half is
+# always the thing you're actually editing: in a worktree the parent repo demotes
+# itself, so a glance answers "am I in my real checkout or a disposable copy?".
 repo_name=$(json_get 'workspace.repo.name')
 project_dir=$(json_get 'workspace.project_dir')
 cwd=$(json_get 'cwd')
+worktree=$(json_get 'workspace.git_worktree')
+
+# Base name: repo if the remote is known, else the directory we're rooted in.
+base_name=""
+if   [ -n "$repo_name" ];   then base_name="$repo_name"
+elif [ -n "$project_dir" ]; then base_name=$(basename "$project_dir")
+elif [ -n "$cwd" ];         then base_name=$(basename "$cwd")
+fi
 
 location_part=""
-if [ -n "$repo_name" ]; then
-    location_part="${C_LOCATION}${repo_name}${RESET}"
-    worktree=$(json_get 'workspace.git_worktree')
-    [ -n "$worktree" ] && location_part="${location_part}${C_MUTED}@${worktree}${RESET}"
-elif [ -n "$project_dir" ]; then
-    location_part="${C_LOCATION}$(basename "$project_dir")${RESET}"
-elif [ -n "$cwd" ]; then
-    location_part="${C_LOCATION}$(basename "$cwd")${RESET}"
+if [ -n "$worktree" ]; then
+    # Truncate the worktree, never the repo — the repo is the stable anchor.
+    [ "${#worktree}" -gt 24 ] && worktree="${worktree:0:23}…"
+    if [ -n "$base_name" ]; then
+        location_part="${C_LOC_PARENT}${base_name}/${C_LOCATION}${worktree}${RESET}"
+    else
+        location_part="${C_LOCATION}${worktree}${RESET}"
+    fi
+elif [ -n "$base_name" ]; then
+    location_part="${C_LOCATION}${base_name}${RESET}"
 fi
 
 # ── 4. SESSION ────────────────────────────────────────────────────────────────
@@ -200,8 +214,10 @@ if [ -n "$five_pct" ] || [ -n "$week_pct" ]; then
             now=$(date +%s)
             mins_left=$(( (week_resets - now + 59) / 60 ))
             if [ "$mins_left" -gt 0 ]; then
-                reset_time=$(date -d "@${week_resets}" +"%b %-d %-I%p" 2>/dev/null | awk '{sub(/AM$/,"am"); sub(/PM$/,"pm"); print}')
-                [ -z "$reset_time" ] && reset_time=$(date -r "${week_resets}" +"%b %e %I%p" 2>/dev/null | sed 's/  / /; s/0\([0-9][AP]M\)/\1/' | awk '{sub(/AM$/,"am"); sub(/PM$/,"pm"); print}')
+                # 24-hour, matching the 5h segment. %-d (no day padding) works on
+                # both GNU and BSD date, so one format serves both branches.
+                reset_time=$(date -d "@${week_resets}" +"%b %-d %H:%M" 2>/dev/null)
+                [ -z "$reset_time" ] && reset_time=$(date -r "${week_resets}" +"%b %-d %H:%M" 2>/dev/null)
                 [ -n "$reset_time" ] && rate_pieces="${rate_pieces} ${C_MUTED}${reset_time}${RESET}"
             fi
         fi
