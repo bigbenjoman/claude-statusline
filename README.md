@@ -16,12 +16,12 @@ ctx ██▒▒▒▒▒▒▒▒ 6% 69k/1M │ 5h 25% 14:27 · 7d 12% Jul 4 12
 
 Two lines, grouped by the question you're actually asking at a glance:
 
-- **Line 1 — identity:** model + reasoning effort · location, as `repo` or `repo/worktree`, then the branch (+ PR status) · session name
+- **Line 1 — identity:** model + reasoning effort · location, as `repo` or `repo/worktree`, then the branch · session name
 - **Line 2 — gauges:** context-window usage · 5-hour and 7-day rate limits with reset times · extra-usage credits
 
 Percentages stay muted until they matter, then turn **amber** and **coral** — so an idle bar is calm and a stressed one grabs your eye. Rate limits ramp at **≥60% / ≥85%**; the context window ramps later (**≥75% / ≥90%**) because it self-heals through compaction, while a spent rate limit locks you out for days. All times are 24-hour.
 
-**Separator grammar**, escalating only as far as it needs to: a sigil (`⎇`, `#`) for items carrying their own mark, `·` between items of one group, `│` between groups.
+**Separator grammar**, escalating only as far as it needs to: a sigil (`⎇`) for items carrying their own mark, `·` between items of one group, `│` between groups.
 
 **Severity never rests on colour alone** — amber and coral differ by only 1.67:1 in luminance, which is no signal at all in a screenshot or with red-green colour blindness. The context bar changes its fill glyph (`█` → `▓`) at critical; credits turn coral when a limit is spent. The percentages carry no marker: `100%` is already unambiguous.
 
@@ -74,7 +74,7 @@ reports terminal width, worktree/branch detection for the current directory, whi
 - **Dividers (`│`) separate groups only** — items within a group take `·`, or nothing at all when they already carry a sigil, keeping the bar narrow and quiet.
 - **Graceful degradation.** Any segment with no data is omitted; if line 2 has nothing, the bar collapses to a single line.
 - **The bright half is what you're editing.** In a linked worktree the location reads `repo/worktree`: the parent repo drops to a desaturated blue and the worktree takes the brighter one. A glance answers "am I in my real checkout, or a disposable copy?" — the question that actually matters with several sessions open against one repo.
-- **The worktree qualifies the location, it isn't a peer of it.** It sits inside the location group rather than earning its own `│`, which keeps line 1 at three groups even when a PR badge is showing. Outside a worktree the segment simply isn't there. The branch follows the same rule.
+- **The worktree qualifies the location, it isn't a peer of it.** It sits inside the location group rather than earning its own `│`, which keeps line 1 at three groups. Outside a worktree the segment simply isn't there. The branch follows the same rule.
 - **Consequences inherit their cause's alarm.** A rate limit at 100% is the moment work starts spending real money, which is precisely what the credits segment reports. So when any limit is spent, `extra:` turns coral — otherwise the two causally linked facts sit on the same line looking unrelated, and the one denominated in money is the calmer of the pair.
 - **Contrast is measured, not eyeballed.** Text tokens clear WCAG AA (4.5:1) against a dark charcoal terminal; bar cells and dividers are non-text UI components and owe 3:1, which is why the divider stays as it is and only the empty bar cells (2.27:1, failing even that) were lightened.
 
@@ -96,6 +96,10 @@ The `extra:` segment (pay-as-you-go credit spend, `used/limit`) is **not** in th
 
 The endpoint reports `used_credits` in **minor units** — `993` with `decimal_places: 2` is £9.93, not £993.00 (the same payload spells this out as `spend.used: {amount_minor, exponent}`). The amount is scaled by `10^decimal_places` before formatting.
 
+## Not shown
+
+**Pull request status.** Claude Code renders its own line beneath this one that already carries the PR, so a badge here would only duplicate it. The stdin fields `pr.number` and `pr.review_state` are deliberately ignored.
+
 ## Requirements
 
 - Claude Code (a build that feeds `context_window` and `rate_limits` into the status line for those segments to appear).
@@ -111,7 +115,6 @@ From the status line's stdin JSON:
 | `model.display_name`, `effort.level` | model + effort |
 | `workspace.repo.name` | location (preferred) |
 | `workspace.project_dir`, `cwd` | location fallbacks, in that order; `cwd` is also what git is asked about for worktree detection |
-| `pr.number`, `pr.review_state` | PR badge |
 | `session_name` | session |
 | `context_window.*` | context bar |
 | `rate_limits.five_hour.*`, `rate_limits.seven_day.*` | rate-limit gauges + reset times; either at 100% also raises the credits alarm |

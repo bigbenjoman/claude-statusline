@@ -8,7 +8,7 @@
 #      MERGING into any existing settings (a timestamped .bak backup is made first).
 #
 # THE STATUS LINE (two lines, grouped by the question you're asking):
-#   line 1 — identity:  model + effort  │  repo[/worktree] ⎇ branch (+PR)  │  session
+#   line 1 — identity:  model + effort  │  repo[/worktree] ⎇ branch  │  session
 #   line 2 — gauges:    context bar  │  5h · 7d limits  │  extra credits
 #   Percentages stay muted until elevated, then turn amber / coral — rate limits
 #   at >=60/85%, the context window later (>=75/90%) since it self-heals.
@@ -72,10 +72,8 @@ C_MUTED="\033[38;5;245m"      # dim gray        — secondary / token counts (4.
 C_LOCATION="\033[38;5;110m"   # muted sky blue  — repo / dir name (or worktree) (7.0:1)
 C_LOC_PARENT="\033[38;5;103m" # dusty periwinkle— parent repo + branch     (4.7:1)
 C_SESSION="\033[38;5;252m"    # near-white      — session name            (10.5:1)
-C_OK="\033[38;5;150m"         # sage green      — PR approved
-C_WARN="\033[38;5;221m"       # golden yellow   — open PR, mid rate limit
-C_CRIT="\033[38;5;210m"       # soft coral      — changes requested, high rate limit
-C_DRAFT="\033[38;5;242m"      # dim gray        — PR draft
+C_WARN="\033[38;5;221m"       # golden yellow   — mid rate limit
+C_CRIT="\033[38;5;210m"       # soft coral      — high rate limit, spent credits
 
 # Separator grammar, escalating only as far as it needs to:
 #   sigil (⎇ #)  items that already carry their own mark
@@ -232,23 +230,7 @@ fi
 # ── 4. SESSION ────────────────────────────────────────────────────────────────
 session_name=$(json_get 'session_name')
 
-# ── 5. PR ─────────────────────────────────────────────────────────────────────
-pr_part=""
-pr_num=$(json_get 'pr.number')
-if [ -n "$pr_num" ]; then
-    pr_state=$(json_get 'pr.review_state')
-    [ -z "$pr_state" ] && pr_state="open"
-    case "$pr_state" in
-        approved)           pr_color="$C_OK"    pr_label="✓" ;;
-        changes_requested)  pr_color="$C_CRIT"  pr_label="✗" ;;
-        draft)              pr_color="$C_DRAFT"  pr_label="~" ;;
-        *)                  pr_color="$C_WARN"   pr_label="·" ;;
-    esac
-    pr_part="${C_MUTED}#${RESET}${pr_color}${pr_num} ${pr_label} ${pr_state}${RESET}"
-    pr_plain="#${pr_num} ${pr_label} ${pr_state}"   # for width accounting
-fi
-
-# ── 6. RATE LIMITS (only shown/coloured when elevated) ───────────────────────
+# ── 5. RATE LIMITS (only shown/coloured when elevated) ───────────────────────
 five_int=""; five_time=""
 week_int=""; week_time=""
 five_pct=$(json_get 'rate_limits.five_hour.used_percentage')
@@ -280,7 +262,7 @@ limits_maxed=0
 [ -n "${five_int:-}" ] && [ "$five_int" -ge 100 ] && limits_maxed=1
 [ -n "${week_int:-}" ] && [ "$week_int" -ge 100 ] && limits_maxed=1
 
-# ── 7. EXTRA USAGE / CREDITS (pay-as-you-go) ─────────────────────────────────
+# ── 6. EXTRA USAGE / CREDITS (pay-as-you-go) ─────────────────────────────────
 # This is NOT in the status-line stdin, so we fetch it from the OAuth usage
 # endpoint (same one Claude Code uses) and cache it with a background refresh.
 # Silently shows nothing if there's no token or the endpoint is unavailable.
@@ -452,7 +434,6 @@ l1_width() {
     elif [ -n "$base_name" ];                     then loc=${#base_name}
     fi
     [ -n "$branch" ] && [ "$loc" -gt 0 ] && loc=$(( loc + 3 + ${#branch} ))   # " ⎇ "
-    [ -n "$pr_plain" ] && loc=$(( loc + 1 + ${#pr_plain} ))
     [ "$loc" -gt 0 ] && { w=$(( w + loc )); groups=$(( groups + 1 )); }
     [ -n "$session_name" ] && { w=$(( w + ${#session_name} )); groups=$(( groups + 1 )); }
     [ "$groups" -gt 1 ] && w=$(( w + 3 * (groups - 1) ))   # " │ " per divider
@@ -509,9 +490,8 @@ fi
 session_part=""
 [ -n "$session_name" ] && session_part="${C_SESSION}${session_name}${RESET}"
 
-# Line 1 — identity: model/effort · repo(+PR) · session
+# Line 1 — identity: model/effort · repo/worktree + branch · session
 location_group="$location_part"
-[ -n "$pr_part" ] && location_group="${location_group:+$location_group }${pr_part}"
 line1=$(join_sep "$model_part" "$location_group" "$session_part")
 
 # ── FIT LINE 2 ───────────────────────────────────────────────────────────────
