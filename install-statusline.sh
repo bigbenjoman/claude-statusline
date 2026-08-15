@@ -82,19 +82,45 @@ C_CRIT="\033[38;5;210m"       # soft coral      — high rate limit, spent credi
 SEP=" \033[38;5;244m│\033[0m "
 ITEM_SEP=" \033[38;5;245m·\033[0m "
 
-# ── JSON helper ───────────────────────────────────────────────────────────────
-json_get() {
+# ── Read every field in ONE parse ────────────────────────────────────────────
+# This used to be a json_get() helper called once per field, which spawned a
+# node process per field — 13 interpreter starts (~20ms each) to read 13 values
+# out of a single object. Claude Code debounces the status line at 300ms and
+# CANCELS an in-flight script when a new update arrives, so a slow render is not
+# merely slow: it is a render that never paints while you are working.
+#
+# The protocol is newline-delimited values in a fixed order. Absent and null
+# fields come back as empty lines, so the "was it present?" checks downstream
+# are unchanged. Any newline inside a value is flattened first — one stray \n
+# would shift every field after it onto the wrong variable.
+read_fields() {
     echo "$input" | node -e "
 let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
-  try{
-    let obj=JSON.parse(d);
-    const keys='$1'.split('.');
-    for(const k of keys){if(k&&obj&&typeof obj==='object')obj=obj[k];else{obj=undefined;break;}}
-    if(obj!=null&&obj!==undefined)process.stdout.write(String(obj));
-  }catch(e){}
+  let o={};try{o=JSON.parse(d)}catch(e){}
+  const g=p=>{let v=o;
+    for(const k of p.split('.')){if(v&&typeof v==='object')v=v[k];else return ''}
+    return (v==null)?'':String(v).replace(/[\r\n]+/g,' ')};
+  process.stdout.write([
+    'model.display_name','effort.level',
+    'context_window.used_percentage','context_window.total_input_tokens',
+    'context_window.context_window_size',
+    'workspace.repo.name','workspace.project_dir','cwd','session_name',
+    'rate_limits.five_hour.used_percentage','rate_limits.five_hour.resets_at',
+    'rate_limits.seven_day.used_percentage','rate_limits.seven_day.resets_at',
+  ].map(g).join('\n'));
 });
 " 2>/dev/null
 }
+
+# Order here must match the list above. The herestring supplies the trailing
+# newline the final field lacks, so every read succeeds.
+{ read -r model_name  ; read -r effort_level
+  read -r used_pct    ; read -r total_input   ; read -r ctx_size
+  read -r repo_name   ; read -r project_dir   ; read -r cwd
+  read -r session_name
+  read -r five_pct    ; read -r five_resets
+  read -r week_pct    ; read -r week_resets
+} <<< "$(read_fields)"
 
 # ── Severity thresholds ───────────────────────────────────────────────────────
 # Rate limits are the scarce resource: hitting 100% locks you out for hours or
@@ -110,6 +136,11 @@ CTX_WARN_AT=75 ; CTX_CRIT_AT=90  # context window
 # coral differ by only 1.67:1 in luminance, which is not a signal on its own.
 make_bar() {
     local pct=$1 width=$2 warn=${3:-$WARN_AT} crit=${4:-$CRIT_AT}
+    # Clamp before the arithmetic: a pct outside 0..100 would otherwise produce a
+    # bar wider than the width l2_width() budgeted for it, overflowing the line
+    # the fit pass exists to protect.
+    [ "$pct" -lt 0 ]   && pct=0
+    [ "$pct" -gt 100 ] && pct=100
     local filled=$(( pct * width / 100 ))
     local empty=$(( width - filled ))
     local color glyph="█"
@@ -117,10 +148,14 @@ make_bar() {
     elif [ "$pct" -ge "$warn" ]; then color="$C_BAR_WARN"
     else                              color="$C_BAR_NEUT"
     fi
-    local bar="${color}"
-    for i in $(seq 1 $filled 2>/dev/null); do bar="${bar}${glyph}"; done
+    # NOT `seq 1 $n`: BSD seq counts DOWN when first > last, so `seq 1 0` prints
+    # "1 0" and a zero-length run of cells rendered as TWO cells — showing usage
+    # at 0% and headroom at 100%, the wrong signal at both ends of the scale.
+    # Arithmetic-for is correct for 0 and negative counts, and costs no fork.
+    local bar="${color}" i
+    for (( i = 0; i < filled; i++ )); do bar="${bar}${glyph}"; done
     bar="${bar}${C_BAR_EMPTY}"
-    for i in $(seq 1 $empty 2>/dev/null); do bar="${bar}▒"; done
+    for (( i = 0; i < empty;  i++ )); do bar="${bar}▒"; done
     bar="${bar}${RESET}"
     printf "%b" "$bar"
 }
@@ -140,20 +175,16 @@ pct_color() {
 # bar's fill glyph (█ → ▓), and credits turn coral when a limit is spent.
 
 # ── 1. MODEL + EFFORT ─────────────────────────────────────────────────────────
-# Values stay plain until the FIT pass below has decided what survives; the
-# coloured strings are built once, at assembly, from whatever is left.
-model_name=$(json_get 'model.display_name')
-effort_level=$(json_get 'effort.level')
+# model_name / effort_level arrive from the single parse above. Values stay
+# plain until the FIT pass below has decided what survives; the coloured strings
+# are built once, at assembly, from whatever is left.
 
 # ── 2. CONTEXT BAR (shows how much context has been USED) ────────────────────
 used_int=""
 used_k=""
 ctx_bar_w=10
-used_pct=$(json_get 'context_window.used_percentage')
 if [ -n "$used_pct" ]; then
     used_int=$(printf "%.0f" "$used_pct")
-    total_input=$(json_get 'context_window.total_input_tokens')
-    ctx_size=$(json_get 'context_window.context_window_size')
     if [ -n "$total_input" ] && [ -n "$ctx_size" ]; then
         used_k=$(echo "$total_input $ctx_size" | awk 'function fmt(n){ if(n>=1000000){v=n/1000000; if(v==int(v)) return sprintf("%dM",v); return sprintf("%.1fM",v)} return sprintf("%dk",n/1000)}
 {printf "%s/%s", fmt($1), fmt($2)}')
@@ -164,9 +195,7 @@ fi
 # Rendered as repo/worktree when cwd is in a linked worktree. The BRIGHT half is
 # always the thing you're actually editing: in a worktree the parent repo demotes
 # itself, so a glance answers "am I in my real checkout or a disposable copy?".
-repo_name=$(json_get 'workspace.repo.name')
-project_dir=$(json_get 'workspace.project_dir')
-cwd=$(json_get 'cwd')
+# repo_name / project_dir / cwd arrive from the single parse above.
 
 # The status-line stdin has no worktree field, so ask git directly. A linked
 # worktree is exactly the case where --git-dir differs from --git-common-dir;
@@ -228,15 +257,13 @@ fi
 [ "${#worktree}" -gt 24 ] && worktree="${worktree:0:23}…"
 
 # ── 4. SESSION ────────────────────────────────────────────────────────────────
-session_name=$(json_get 'session_name')
+# session_name arrives from the single parse above.
 
 # ── 5. RATE LIMITS (only shown/coloured when elevated) ───────────────────────
+# five_pct / five_resets / week_pct / week_resets likewise. Each window is
+# independently absent for non-subscribers, which reads here as an empty string.
 five_int=""; five_time=""
 week_int=""; week_time=""
-five_pct=$(json_get 'rate_limits.five_hour.used_percentage')
-five_resets=$(json_get 'rate_limits.five_hour.resets_at')
-week_pct=$(json_get 'rate_limits.seven_day.used_percentage')
-week_resets=$(json_get 'rate_limits.seven_day.resets_at')
 now=$(date +%s)
 if [ -n "$five_pct" ]; then
     five_int=$(printf "%.0f" "$five_pct")
@@ -352,13 +379,22 @@ if [ -f "$XU_CACHE" ]; then
     xu_age=$(( $(date +%s) - xu_mtime ))
 fi
 if [ "$xu_age" -ge "$XU_TTL" ]; then
-    if [ -f "$XU_CACHE" ]; then
-        # stale: refresh in background (unique tmp + atomic mv, no lock), render stale now
-        ( o=$(xu_fetch 2>/dev/null); [ -n "$o" ] && printf '%s' "$o" > "$XU_CACHE.$$" && mv "$XU_CACHE.$$" "$XU_CACHE"; ) >/dev/null 2>&1 &
-    else
-        # nothing cached: one synchronous fetch so the first render has data
-        o=$(xu_fetch 2>/dev/null); [ -n "$o" ] && printf '%s' "$o" > "$XU_CACHE"
-    fi
+    # Claim the slot BEFORE forking. The status line can re-run every 300ms, and
+    # an in-flight fetch is invisible to the next render — without a claim, a
+    # cold cache makes every render start its own curl. An empty file reads as
+    # fresh (age 0) and as "nothing to show" (the reader tests -s), so the
+    # stampede collapses to one fetch and the segment stays absent until it lands.
+    [ -f "$XU_CACHE" ] || : > "$XU_CACHE"
+    # One path for warm and cold alike: background, unique tmp, atomic mv.
+    # The cold path used to fetch SYNCHRONOUSLY straight into $XU_CACHE — the
+    # branch that blocked the first render for up to curl's 5s --max-time, which
+    # made it the branch most likely to be cancelled by Claude Code mid-write,
+    # and the only one without tmp+rename to survive being cancelled. A killed
+    # fetch now costs a stray $XU_CACHE.$$ that nothing reads, not a truncated
+    # cache that silently hides the credits segment until the TTL expires.
+    ( o=$(xu_fetch 2>/dev/null)
+      [ -n "$o" ] && printf '%s' "$o" > "$XU_CACHE.$$" && mv "$XU_CACHE.$$" "$XU_CACHE"
+    ) >/dev/null 2>&1 &
 fi
 
 if [ -s "$XU_CACHE" ]; then
@@ -501,7 +537,12 @@ line1=$(join_sep "$model_part" "$location_group" "$session_part")
 l2_width() {
     local w=0 groups=0
     if [ -n "$used_int" ]; then
-        w=$(( w + 4 + ctx_bar_w + 1 + ${#used_int} + 1 ))          # "ctx " bar " NN%"
+        w=$(( w + 4 + ${#used_int} + 1 ))                          # "ctx " "NN%"
+        # The bar and the space that separates it from the percentage both
+        # disappear together at the ctx_bar_w=0 rung, so they are budgeted
+        # together — counting the separator for a bar that isn't there is how
+        # you get "ctx  50%" with a hole in it.
+        [ "$ctx_bar_w" -gt 0 ] && w=$(( w + ctx_bar_w + 1 ))
         [ -n "$used_k" ] && w=$(( w + 1 + ${#used_k} ))
         groups=$(( groups + 1 ))
     fi
@@ -541,9 +582,15 @@ l2_width() {
 # ── Build line 2 from what survived ──────────────────────────────────────────
 ctx_part=""
 if [ -n "$used_int" ]; then
-    ctx_bar=$(make_bar "$used_int" "$ctx_bar_w" "$CTX_WARN_AT" "$CTX_CRIT_AT")
     pct_c=$(pct_color "$used_int" "$CTX_WARN_AT" "$CTX_CRIT_AT")
-    ctx_part="${C_MUTED}ctx ${RESET}${ctx_bar} ${pct_c}${used_int}%${RESET}"
+    ctx_part="${C_MUTED}ctx ${RESET}"
+    # At the narrowest rung the bar is dropped entirely; it takes its trailing
+    # separator with it, so the label sits straight against the percentage.
+    if [ "$ctx_bar_w" -gt 0 ]; then
+        ctx_bar=$(make_bar "$used_int" "$ctx_bar_w" "$CTX_WARN_AT" "$CTX_CRIT_AT")
+        ctx_part="${ctx_part}${ctx_bar} "
+    fi
+    ctx_part="${ctx_part}${pct_c}${used_int}%${RESET}"
     [ -n "$used_k" ] && ctx_part="${ctx_part} ${C_MUTED}${used_k}${RESET}"
 fi
 
