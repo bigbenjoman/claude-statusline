@@ -8,10 +8,16 @@
 #      MERGING into any existing settings (a timestamped .bak backup is made first).
 #
 # THE STATUS LINE (two lines, grouped by the question you're asking):
-#   line 1 — identity:  model + effort  │  repo[/worktree] (+PR)  │  session
-#   line 2 — gauges:    context bar  │  5h limit  │  7d limit  │  extra: used/limit
-#   Percentages stay muted until elevated, then turn amber (>=60%) / coral (>=85%).
+#   line 1 — identity:  model + effort  │  repo[/worktree] ⎇ branch (+PR)  │  session
+#   line 2 — gauges:    context bar  │  5h · 7d limits  │  extra credits
+#   Percentages stay muted until elevated, then turn amber / coral — rate limits
+#   at >=60/85%, the context window later (>=75/90%) since it self-heals.
 #   Segments with no data are omitted; if line 2 is empty it collapses to one line.
+#   Both lines fit themselves to $COLUMNS, dropping the cheapest information
+#   first, so nothing is silently truncated off the right edge.
+#
+# NOTE: the worktree half of the location is also absent from stdin — it is
+#   derived by asking git whether cwd sits in a linked worktree.
 #
 # NOTE: "extra:" (pay-as-you-go credits) is NOT in the status-line stdin, so it
 #   is fetched from Anthropic's OAuth usage endpoint using your Claude Code
@@ -37,29 +43,46 @@ cat > "$SCRIPT_PATH" <<'STATUSLINE_EOF'
 #!/usr/bin/env bash
 # Claude Code Status Line
 
-input=$(cat)
+# ── Diagnostics (bash statusline-command.sh --debug) ─────────────────────────
+# The extra-usage segment fails silently by design, which makes "no token",
+# "endpoint down" and "credits disabled" indistinguishable on the bar. Rather
+# than spend bar space on that, the failure is inspectable on demand. This runs
+# before stdin is read, so it works from a normal shell with no JSON piped in.
+STATUSLINE_DEBUG=""
+[ "${1:-}" = "--debug" ] && STATUSLINE_DEBUG=1
+
+[ -z "$STATUSLINE_DEBUG" ] && input=$(cat)
 
 # ── Colour palette ────────────────────────────────────────────────────────────
+# Contrast is measured against a dark charcoal terminal (#1e2127). Text tokens
+# clear WCAG AA (4.5:1); bar cells and dividers are non-text UI components, so
+# they only owe 3:1 — which is why the divider stays at 244 (4.08) and only the
+# empty cells, which failed even that at 2.27, moved.
 RESET="\033[0m"
 DIM="\033[2m"
 
-C_MODEL="\033[38;5;183m"      # soft lavender   — model name
-C_EFFORT="\033[38;5;139m"     # dusty mauve     — effort suffix
-C_BAR_NEUT="\033[38;5;248m"   # light gray      — bar fill, low usage
-C_BAR_WARN="\033[38;5;221m"   # golden yellow   — bar fill, mid usage
-C_BAR_CRIT="\033[38;5;210m"   # soft coral      — bar fill, high usage
-C_BAR_EMPTY="\033[38;5;240m"  # dark gray       — empty bar cells
-C_VALUE="\033[97m"             # bright white    — primary values
-C_MUTED="\033[38;5;242m"      # dim gray        — secondary / token counts
-C_LOCATION="\033[38;5;110m"   # muted sky blue  — repo / dir name (or worktree)
-C_LOC_PARENT="\033[38;5;66m"  # desaturated sky — parent repo, when in a worktree
-C_SESSION="\033[38;5;252m"    # near-white      — session name
+C_MODEL="\033[38;5;183m"      # soft lavender   — model name              (8.8:1)
+C_EFFORT="\033[38;5;139m"     # dusty mauve     — effort suffix           (5.3:1)
+C_BAR_NEUT="\033[38;5;248m"   # light gray      — bar fill, low usage      (6.8:1)
+C_BAR_WARN="\033[38;5;221m"   # golden yellow   — bar fill, mid usage     (11.6:1)
+C_BAR_CRIT="\033[38;5;210m"   # soft coral      — bar fill, high usage     (7.0:1)
+C_BAR_EMPTY="\033[38;5;243m"  # dark gray       — empty bar cells          (3.6:1)
+C_VALUE="\033[97m"             # bright white    — primary values          (16:1)
+C_MUTED="\033[38;5;245m"      # dim gray        — secondary / token counts (4.7:1)
+C_LOCATION="\033[38;5;110m"   # muted sky blue  — repo / dir name (or worktree) (7.0:1)
+C_LOC_PARENT="\033[38;5;103m" # dusty periwinkle— parent repo + branch     (4.7:1)
+C_SESSION="\033[38;5;252m"    # near-white      — session name            (10.5:1)
 C_OK="\033[38;5;150m"         # sage green      — PR approved
 C_WARN="\033[38;5;221m"       # golden yellow   — open PR, mid rate limit
 C_CRIT="\033[38;5;210m"       # soft coral      — changes requested, high rate limit
 C_DRAFT="\033[38;5;242m"      # dim gray        — PR draft
 
+# Separator grammar, escalating only as far as it needs to:
+#   sigil (⎇ #)  items that already carry their own mark
+#   ·            items inside one group
+#   │            between groups
 SEP=" \033[38;5;244m│\033[0m "
+ITEM_SEP=" \033[38;5;245m·\033[0m "
 
 # ── JSON helper ───────────────────────────────────────────────────────────────
 json_get() {
@@ -75,18 +98,29 @@ let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
 " 2>/dev/null
 }
 
+# ── Severity thresholds ───────────────────────────────────────────────────────
+# Rate limits are the scarce resource: hitting 100% locks you out for hours or
+# days and starts spending real money. Context is not — it self-heals through
+# compaction — so its ramp starts later, keeping the loudest thing on the bar
+# the thing you can least afford to run out of.
+WARN_AT=60 ; CRIT_AT=85          # rate limits + credits
+CTX_WARN_AT=75 ; CTX_CRIT_AT=90  # context window
+
 # ── Progress bar (fills left-to-right as value increases) ────────────────────
+# The fill GLYPH changes at critical as well as the colour, so severity survives
+# a mono terminal, a screenshot, and red-green colour blindness — amber and
+# coral differ by only 1.67:1 in luminance, which is not a signal on its own.
 make_bar() {
-    local pct=$1 width=$2
+    local pct=$1 width=$2 warn=${3:-$WARN_AT} crit=${4:-$CRIT_AT}
     local filled=$(( pct * width / 100 ))
     local empty=$(( width - filled ))
-    local color
-    if   [ "$pct" -ge 85 ]; then color="$C_BAR_CRIT"
-    elif [ "$pct" -ge 60 ]; then color="$C_BAR_WARN"
-    else                         color="$C_BAR_NEUT"
+    local color glyph="█"
+    if   [ "$pct" -ge "$crit" ]; then color="$C_BAR_CRIT" glyph="▓"
+    elif [ "$pct" -ge "$warn" ]; then color="$C_BAR_WARN"
+    else                              color="$C_BAR_NEUT"
     fi
     local bar="${color}"
-    for i in $(seq 1 $filled 2>/dev/null); do bar="${bar}█"; done
+    for i in $(seq 1 $filled 2>/dev/null); do bar="${bar}${glyph}"; done
     bar="${bar}${C_BAR_EMPTY}"
     for i in $(seq 1 $empty 2>/dev/null); do bar="${bar}▒"; done
     bar="${bar}${RESET}"
@@ -95,42 +129,37 @@ make_bar() {
 
 # ── Colour for a percentage value (only highlights when elevated) ─────────────
 pct_color() {
-    local pct=$1
-    if   [ "$pct" -ge 85 ]; then printf "%b" "$C_CRIT"
-    elif [ "$pct" -ge 60 ]; then printf "%b" "$C_WARN"
-    else                         printf "%b" "\033[38;5;73m"
+    local pct=$1 warn=${2:-$WARN_AT} crit=${3:-$CRIT_AT}
+    if   [ "$pct" -ge "$crit" ]; then printf "%b" "$C_CRIT"
+    elif [ "$pct" -ge "$warn" ]; then printf "%b" "$C_WARN"
+    else                              printf "%b" "\033[38;5;73m"
     fi
 }
 
+# Severity deliberately carries NO text marker on the percentages: "100%" is
+# already unambiguous, and "100%!" reads as shouting at someone who can see the
+# number. The non-colour signal lives where the number can't carry it — the
+# bar's fill glyph (█ → ▓), and credits turn coral when a limit is spent.
+
 # ── 1. MODEL + EFFORT ─────────────────────────────────────────────────────────
+# Values stay plain until the FIT pass below has decided what survives; the
+# coloured strings are built once, at assembly, from whatever is left.
 model_name=$(json_get 'model.display_name')
 effort_level=$(json_get 'effort.level')
 
-model_part=""
-if [ -n "$model_name" ]; then
-    model_part="${C_MODEL}${model_name}${RESET}"
-    [ -n "$effort_level" ] && model_part="${model_part} ${C_EFFORT}${effort_level}${RESET}"
-fi
-
 # ── 2. CONTEXT BAR (shows how much context has been USED) ────────────────────
-ctx_part=""
+used_int=""
+used_k=""
+ctx_bar_w=10
 used_pct=$(json_get 'context_window.used_percentage')
 if [ -n "$used_pct" ]; then
     used_int=$(printf "%.0f" "$used_pct")
-    ctx_bar=$(make_bar "$used_int" 10)
-
-    pct_c=$(pct_color "$used_int")
-
     total_input=$(json_get 'context_window.total_input_tokens')
     ctx_size=$(json_get 'context_window.context_window_size')
-    token_str=""
     if [ -n "$total_input" ] && [ -n "$ctx_size" ]; then
         used_k=$(echo "$total_input $ctx_size" | awk 'function fmt(n){ if(n>=1000000){v=n/1000000; if(v==int(v)) return sprintf("%dM",v); return sprintf("%.1fM",v)} return sprintf("%dk",n/1000)}
 {printf "%s/%s", fmt($1), fmt($2)}')
-        token_str=" ${C_MUTED}${used_k}${RESET}"
     fi
-
-    ctx_part="${C_MUTED}ctx ${RESET}${ctx_bar} ${pct_c}${used_int}%${RESET}${token_str}"
 fi
 
 # ── 3. LOCATION (repo name only — no owner prefix) ───────────────────────────
@@ -140,32 +169,68 @@ fi
 repo_name=$(json_get 'workspace.repo.name')
 project_dir=$(json_get 'workspace.project_dir')
 cwd=$(json_get 'cwd')
-worktree=$(json_get 'workspace.git_worktree')
+
+# The status-line stdin has no worktree field, so ask git directly. A linked
+# worktree is exactly the case where --git-dir differs from --git-common-dir;
+# --path-format=absolute is required, or a plain subdirectory of the MAIN
+# checkout reports "../.git" vs "/repo/.git" and false-positives as a worktree.
+worktree=""
+worktree_parent=""
+branch=""
+if [ -n "$cwd" ] && command -v git >/dev/null 2>&1; then
+    # One process answers both questions. In a repo with no commits this exits
+    # 128 after printing the first three lines, so parse by line and let the
+    # branch simply come back empty rather than losing the location too.
+    git_info=$(cd "$cwd" 2>/dev/null && git rev-parse --path-format=absolute \
+        --git-dir --git-common-dir --show-toplevel --abbrev-ref HEAD 2>/dev/null)
+    if [ -n "$git_info" ]; then
+        git_dir=$(printf '%s\n' "$git_info" | awk 'NR==1')
+        git_common=$(printf '%s\n' "$git_info" | awk 'NR==2')
+        git_top=$(printf '%s\n' "$git_info" | awk 'NR==3')
+        branch=$(printf '%s\n' "$git_info" | awk 'NR==4')
+        if [ -n "$git_dir" ] && [ "$git_dir" != "$git_common" ]; then
+            worktree=$(basename "$git_top")
+            worktree_parent=$(basename "$(dirname "$git_common")")
+        fi
+        # --abbrev-ref is sticky, so a detached HEAD reports the literal
+        # "HEAD" and the sha costs one extra call — only in that rare case.
+        if [ "$branch" = "HEAD" ]; then
+            branch=$(cd "$cwd" 2>/dev/null && git rev-parse --short HEAD 2>/dev/null)
+            # "@" (not colour) is what marks a detached head, so it still reads
+            # on a mono terminal. Deliberately NOT amber: agent worktrees are
+            # detached by default, and an alarm that fires every time is noise.
+            [ -n "$branch" ] && branch="@${branch}"
+        fi
+        [ "${#branch}" -gt 22 ] && branch="${branch:0:21}…"
+    fi
+fi
 
 # Base name: repo if the remote is known, else the directory we're rooted in.
+# In a worktree, project_dir/cwd point at the worktree itself, so the main
+# checkout's directory name is the only honest local fallback for the parent.
 base_name=""
-if   [ -n "$repo_name" ];   then base_name="$repo_name"
-elif [ -n "$project_dir" ]; then base_name=$(basename "$project_dir")
-elif [ -n "$cwd" ];         then base_name=$(basename "$cwd")
+if   [ -n "$repo_name" ];        then base_name="$repo_name"
+elif [ -n "$worktree_parent" ];  then base_name="$worktree_parent"
+elif [ -n "$project_dir" ];      then base_name=$(basename "$project_dir")
+elif [ -n "$cwd" ];              then base_name=$(basename "$cwd")
 fi
 
-location_part=""
+# Worktree dirs are usually named "<repo>-<branchish>"; that repeated prefix
+# buys nothing once the repo is already shown to its left, so drop it.
 if [ -n "$worktree" ]; then
-    # Truncate the worktree, never the repo — the repo is the stable anchor.
-    [ "${#worktree}" -gt 24 ] && worktree="${worktree:0:23}…"
-    if [ -n "$base_name" ]; then
-        location_part="${C_LOC_PARENT}${base_name}/${C_LOCATION}${worktree}${RESET}"
-    else
-        location_part="${C_LOCATION}${worktree}${RESET}"
-    fi
-elif [ -n "$base_name" ]; then
-    location_part="${C_LOCATION}${base_name}${RESET}"
+    for prefix in "$base_name" "$worktree_parent"; do
+        [ -z "$prefix" ] && continue
+        case "$worktree" in
+            "$prefix"-?*) worktree="${worktree#"$prefix"-}"; break ;;
+        esac
+    done
 fi
+
+# Truncate the worktree, never the repo — the repo is the stable anchor.
+[ "${#worktree}" -gt 24 ] && worktree="${worktree:0:23}…"
 
 # ── 4. SESSION ────────────────────────────────────────────────────────────────
-session_part=""
 session_name=$(json_get 'session_name')
-[ -n "$session_name" ] && session_part="${C_SESSION}${session_name}${RESET}"
 
 # ── 5. PR ─────────────────────────────────────────────────────────────────────
 pr_part=""
@@ -180,56 +245,48 @@ if [ -n "$pr_num" ]; then
         *)                  pr_color="$C_WARN"   pr_label="·" ;;
     esac
     pr_part="${C_MUTED}#${RESET}${pr_color}${pr_num} ${pr_label} ${pr_state}${RESET}"
+    pr_plain="#${pr_num} ${pr_label} ${pr_state}"   # for width accounting
 fi
 
 # ── 6. RATE LIMITS (only shown/coloured when elevated) ───────────────────────
-rate_part=""
+five_int=""; five_time=""
+week_int=""; week_time=""
 five_pct=$(json_get 'rate_limits.five_hour.used_percentage')
 five_resets=$(json_get 'rate_limits.five_hour.resets_at')
 week_pct=$(json_get 'rate_limits.seven_day.used_percentage')
 week_resets=$(json_get 'rate_limits.seven_day.resets_at')
-if [ -n "$five_pct" ] || [ -n "$week_pct" ]; then
-    rate_pieces=""
-    if [ -n "$five_pct" ]; then
-        five_int=$(printf "%.0f" "$five_pct")
-        rc=$(pct_color "$five_int")
-        rate_pieces="${C_MUTED}5h ${RESET}${rc}${five_int}%${RESET}"
-        if [ -n "$five_resets" ]; then
-            now=$(date +%s)
-            mins_left=$(( (five_resets - now + 59) / 60 ))
-            if [ "$mins_left" -gt 0 ]; then
-                countdown_c="$C_MUTED"
-                reset_time=$(date -d "@${five_resets}" +"%H:%M" 2>/dev/null)
-                [ -z "$reset_time" ] && reset_time=$(date -r "${five_resets}" +"%H:%M" 2>/dev/null)
-                [ -n "$reset_time" ] && rate_pieces="${rate_pieces} ${countdown_c}${reset_time}${RESET}"
-            fi
-        fi
+now=$(date +%s)
+if [ -n "$five_pct" ]; then
+    five_int=$(printf "%.0f" "$five_pct")
+    if [ -n "$five_resets" ] && [ $(( (five_resets - now + 59) / 60 )) -gt 0 ]; then
+        five_time=$(date -d "@${five_resets}" +"%H:%M" 2>/dev/null)
+        [ -z "$five_time" ] && five_time=$(date -r "${five_resets}" +"%H:%M" 2>/dev/null)
     fi
-    if [ -n "$week_pct" ]; then
-        week_int=$(printf "%.0f" "$week_pct")
-        rc=$(pct_color "$week_int")
-        [ -n "$rate_pieces" ] && rate_pieces="${rate_pieces}${SEP}"
-        rate_pieces="${rate_pieces}${C_MUTED}7d ${RESET}${rc}${week_int}%${RESET}"
-        if [ -n "$week_resets" ]; then
-            now=$(date +%s)
-            mins_left=$(( (week_resets - now + 59) / 60 ))
-            if [ "$mins_left" -gt 0 ]; then
-                # 24-hour, matching the 5h segment. %-d (no day padding) works on
-                # both GNU and BSD date, so one format serves both branches.
-                reset_time=$(date -d "@${week_resets}" +"%b %-d %H:%M" 2>/dev/null)
-                [ -z "$reset_time" ] && reset_time=$(date -r "${week_resets}" +"%b %-d %H:%M" 2>/dev/null)
-                [ -n "$reset_time" ] && rate_pieces="${rate_pieces} ${C_MUTED}${reset_time}${RESET}"
-            fi
-        fi
-    fi
-    rate_part="$rate_pieces"
 fi
+if [ -n "$week_pct" ]; then
+    week_int=$(printf "%.0f" "$week_pct")
+    if [ -n "$week_resets" ] && [ $(( (week_resets - now + 59) / 60 )) -gt 0 ]; then
+        # 24-hour, matching the 5h segment. %-d (no day padding) works on both
+        # GNU and BSD date, so one format serves both branches.
+        week_time=$(date -d "@${week_resets}" +"%b %-d %H:%M" 2>/dev/null)
+        [ -z "$week_time" ] && week_time=$(date -r "${week_resets}" +"%b %-d %H:%M" 2>/dev/null)
+    fi
+fi
+
+# A limit at 100% is not just "very high" — it is the moment work starts costing
+# real money, which is exactly what the credits segment below is reporting. The
+# two facts are causally linked, so the consequence inherits the alarm.
+limits_maxed=0
+[ -n "${five_int:-}" ] && [ "$five_int" -ge 100 ] && limits_maxed=1
+[ -n "${week_int:-}" ] && [ "$week_int" -ge 100 ] && limits_maxed=1
 
 # ── 7. EXTRA USAGE / CREDITS (pay-as-you-go) ─────────────────────────────────
 # This is NOT in the status-line stdin, so we fetch it from the OAuth usage
 # endpoint (same one Claude Code uses) and cache it with a background refresh.
 # Silently shows nothing if there's no token or the endpoint is unavailable.
 extra_part=""
+xu_str=""
+xu_reset=""
 XU_CACHE_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/cache"
 XU_CACHE="$XU_CACHE_DIR/statusline-extra-usage.json"
 XU_TTL=120
@@ -256,6 +313,57 @@ xu_fetch() {
         "https://api.anthropic.com/api/oauth/usage"
 }
 
+if [ -n "$STATUSLINE_DEBUG" ]; then
+    echo "── statusline diagnostics ─────────────────────────────────"
+    echo "terminal width : ${COLUMNS:-unset} (COLUMNS) / $(tput cols 2>/dev/null || echo n-a) (tput)"
+    echo "cwd            : $PWD"
+    gi=$(git rev-parse --path-format=absolute --git-dir --git-common-dir --show-toplevel --abbrev-ref HEAD 2>/dev/null)
+    if [ -n "$gi" ]; then
+        echo "git dir        : $(printf '%s\n' "$gi" | awk 'NR==1')"
+        echo "git common dir : $(printf '%s\n' "$gi" | awk 'NR==2')"
+        echo "worktree?      : $([ "$(printf '%s\n' "$gi" | awk 'NR==1')" != "$(printf '%s\n' "$gi" | awk 'NR==2')" ] && echo yes || echo "no (main checkout)")"
+        echo "branch         : $(printf '%s\n' "$gi" | awk 'NR==4')"
+    else
+        echo "git            : not a repository"
+    fi
+    tok=$(xu_token)
+    if [ -n "$tok" ]; then
+        src="unknown"
+        [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && src="CLAUDE_CODE_OAUTH_TOKEN env"
+        [ "$src" = "unknown" ] && command -v security >/dev/null 2>&1 && \
+            security find-generic-password -s "Claude Code-credentials" -w >/dev/null 2>&1 && src="macOS Keychain"
+        [ "$src" = "unknown" ] && [ -f "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json" ] && src="~/.claude/.credentials.json"
+        echo "oauth token    : found (${#tok} chars) via $src"
+    else
+        echo "oauth token    : NOT FOUND — the extra segment will be omitted"
+    fi
+    echo "cache file     : $XU_CACHE"
+    if [ -f "$XU_CACHE" ]; then
+        m=$(stat -f %m "$XU_CACHE" 2>/dev/null || stat -c %Y "$XU_CACHE" 2>/dev/null || echo 0)
+        echo "cache age      : $(( $(date +%s) - m ))s (ttl ${XU_TTL}s)"
+    else
+        echo "cache age      : no cache yet"
+    fi
+    if [ -n "$tok" ]; then
+        code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+            -H "Accept: application/json" -H "Authorization: Bearer $tok" \
+            -H "anthropic-beta: oauth-2025-04-20" -H "User-Agent: claude-code/statusline" \
+            "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+        echo "live fetch     : HTTP ${code:-no response}"
+    fi
+    [ -s "$XU_CACHE" ] && node -e '
+      const fs=require("fs");
+      const o=(JSON.parse(fs.readFileSync(process.argv[1],"utf8")).extra_usage)||{};
+      const dp=(o.decimal_places!=null)?o.decimal_places:2;
+      console.log("is_enabled     : "+o.is_enabled);
+      console.log("currency       : "+o.currency+"  decimal_places: "+dp);
+      console.log("used_credits   : "+o.used_credits+" (minor units) -> "+(Number(o.used_credits)/Math.pow(10,dp)).toFixed(dp));
+      console.log("monthly_limit  : "+(o.monthly_limit==null?"none (unlimited)":o.monthly_limit));
+    ' "$XU_CACHE" 2>/dev/null
+    echo "───────────────────────────────────────────────────────────"
+    exit 0
+fi
+
 xu_age=999999
 if [ -f "$XU_CACHE" ]; then
     xu_mtime=$(stat -f %m "$XU_CACHE" 2>/dev/null || stat -c %Y "$XU_CACHE" 2>/dev/null || echo 0)
@@ -279,15 +387,26 @@ if [ -s "$XU_CACHE" ]; then
         if(!o.is_enabled) process.exit(0);
         const sym={USD:"$",EUR:"€",GBP:"£",JPY:"¥"}[o.currency]||((o.currency||"")+" ");
         const dp=(o.decimal_places!=null)?o.decimal_places:2;
-        const used=(o.used_credits!=null)?Number(o.used_credits).toFixed(dp):null;
-        const lim=(o.monthly_limit!=null)?Number(o.monthly_limit).toFixed(dp):null;
+        // used_credits / monthly_limit are MINOR units — decimal_places says how
+        // many digits to shift, so 668 with dp=2 is £6.68, not £668.00. (The same
+        // payload spells this out under spend.used: {amount_minor, exponent}.)
+        const money=v=>(Number(v)/Math.pow(10,dp)).toFixed(dp);
+        const used=(o.used_credits!=null)?money(o.used_credits):null;
+        const lim=(o.monthly_limit!=null)?money(o.monthly_limit):null;
         if(used==null && lim==null) process.exit(0);
-        let s=sym+(used!=null?used:"0");
+        let s=sym+(used!=null?used:money(0));
         if(lim!=null) s+="/"+sym+lim;
         process.stdout.write(s);
       }catch(e){}
     ' "$XU_CACHE" 2>/dev/null)
-    [ -n "$xu_str" ] && extra_part="${C_MUTED}extra: ${RESET}${C_VALUE}${xu_str}${RESET}"
+    if [ -n "$xu_str" ]; then
+        # Credits reset monthly on the 1st (as the Usage page states); the API
+        # returns no reset field, so the date is derived, not fetched. Without a
+        # horizon a running total has no denominator — every other gauge on this
+        # line tells you when it resets.
+        xu_reset=$(date -v1d -v+1m +"%b %-d" 2>/dev/null)
+        [ -z "$xu_reset" ] && xu_reset=$(date -d "$(date +%Y-%m-01) +1 month" +"%b %-d" 2>/dev/null)
+    fi
 fi
 
 # ── ASSEMBLE (two lines: identity on top, resource gauges below) ─────────────
@@ -303,10 +422,173 @@ join_sep() {                       # join non-empty args with the divider
     printf '%s' "$out"             # raw (keep literal escapes for final %b)
 }
 
+# ── FIT LINE 1 TO THE TERMINAL ───────────────────────────────────────────────
+# Claude Code truncates an over-long status line at the right edge, so the tail
+# silently loses whatever sat there — always the session name. Fitting first
+# means the bar CHOOSES what to give up, cheapest information first, instead of
+# letting position decide. Width comes from the plain values, before any colour
+# codes exist, so nothing has to be un-escaped to be measured.
+term_cols="${COLUMNS:-}"
+[ -z "$term_cols" ] && term_cols=$(tput cols 2>/dev/null)
+case "$term_cols" in ''|*[!0-9]*) term_cols=100 ;; esac
+budget=$(( term_cols - 1 ))        # leave the last cell; some terminals wrap on it
+
+trunc() {                          # $1 string, $2 max — ellipsis is the mark
+    local s=$1 m=$2
+    [ "${#s}" -le "$m" ] && { printf '%s' "$s"; return; }
+    printf '%s…' "${s:0:$((m - 1))}"
+}
+
+l1_width() {
+    local w=0 groups=0
+    if [ -n "$model_name" ]; then
+        w=$(( w + ${#model_name} ))
+        [ -n "$effort_level" ] && w=$(( w + 1 + ${#effort_level} ))
+        groups=$(( groups + 1 ))
+    fi
+    local loc=0
+    if [ -n "$worktree" ] && [ -n "$base_name" ]; then loc=$(( ${#base_name} + 1 + ${#worktree} ))
+    elif [ -n "$worktree" ];                      then loc=${#worktree}
+    elif [ -n "$base_name" ];                     then loc=${#base_name}
+    fi
+    [ -n "$branch" ] && [ "$loc" -gt 0 ] && loc=$(( loc + 3 + ${#branch} ))   # " ⎇ "
+    [ -n "$pr_plain" ] && loc=$(( loc + 1 + ${#pr_plain} ))
+    [ "$loc" -gt 0 ] && { w=$(( w + loc )); groups=$(( groups + 1 )); }
+    [ -n "$session_name" ] && { w=$(( w + ${#session_name} )); groups=$(( groups + 1 )); }
+    [ "$groups" -gt 1 ] && w=$(( w + 3 * (groups - 1) ))   # " │ " per divider
+    printf '%s' "$w"
+}
+
+# Sacrifice ladder, cheapest first. The location is never dropped: it is the one
+# thing a glance is FOR when several sessions are open on one repo.
+if [ "$(l1_width)" -gt "$budget" ] && [ "${#session_name}" -gt 28 ]; then
+    session_name=$(trunc "$session_name" 28)
+fi
+if [ "$(l1_width)" -gt "$budget" ] && [ "${#session_name}" -gt 20 ]; then
+    session_name=$(trunc "$session_name" 20)
+fi
+[ "$(l1_width)" -gt "$budget" ] && branch=""
+[ "$(l1_width)" -gt "$budget" ] && effort_level=""
+[ "$(l1_width)" -gt "$budget" ] && session_name=""
+if [ "$(l1_width)" -gt "$budget" ] && [ -n "$worktree" ]; then
+    worktree=$(trunc "$worktree" 12)
+fi
+# Last resorts: the model's parenthetical qualifier ("(1M context)") is the only
+# part of it you already know, so it goes before the name itself is cut.
+if [ "$(l1_width)" -gt "$budget" ]; then
+    case "$model_name" in *\ \(*) model_name="${model_name%% (*}" ;; esac
+fi
+[ "$(l1_width)" -gt "$budget" ] && model_name=$(trunc "$model_name" 12)
+
+# ── Build line 1 from what survived ──────────────────────────────────────────
+model_part=""
+if [ -n "$model_name" ]; then
+    model_part="${C_MODEL}${model_name}${RESET}"
+    [ -n "$effort_level" ] && model_part="${model_part} ${C_EFFORT}${effort_level}${RESET}"
+fi
+
+location_part=""
+if [ -n "$worktree" ]; then
+    if [ -n "$base_name" ]; then
+        location_part="${C_LOC_PARENT}${base_name}/${C_LOCATION}${worktree}${RESET}"
+    else
+        location_part="${C_LOCATION}${worktree}${RESET}"
+    fi
+elif [ -n "$base_name" ]; then
+    location_part="${C_LOCATION}${base_name}${RESET}"
+fi
+
+# Branch qualifies the location, so it joins that group rather than earning its
+# own divider. Three tiers keep the hierarchy readable: the thing you edit is
+# brightest, its context is desaturated, the glyph is chrome. Override the glyph
+# with STATUSLINE_BRANCH_GLYPH if your font renders ⎇ oddly.
+if [ -n "$branch" ] && [ -n "$location_part" ]; then
+    location_part="${location_part} ${C_MUTED}${STATUSLINE_BRANCH_GLYPH:-⎇}${RESET} ${C_LOC_PARENT}${branch}${RESET}"
+fi
+
+session_part=""
+[ -n "$session_name" ] && session_part="${C_SESSION}${session_name}${RESET}"
+
 # Line 1 — identity: model/effort · repo(+PR) · session
 location_group="$location_part"
 [ -n "$pr_part" ] && location_group="${location_group:+$location_group }${pr_part}"
 line1=$(join_sep "$model_part" "$location_group" "$session_part")
+
+# ── FIT LINE 2 ───────────────────────────────────────────────────────────────
+# Same ladder, different priorities. Credits are never dropped and never lose
+# their alarm: being truncated off the right edge is exactly how a segment that
+# reports money quietly stops being read.
+l2_width() {
+    local w=0 groups=0
+    if [ -n "$used_int" ]; then
+        w=$(( w + 4 + ctx_bar_w + 1 + ${#used_int} + 1 ))          # "ctx " bar " NN%"
+        [ -n "$used_k" ] && w=$(( w + 1 + ${#used_k} ))
+        groups=$(( groups + 1 ))
+    fi
+    local rate=0
+    if [ -n "$five_int" ]; then
+        rate=$(( rate + 3 + ${#five_int} + 1 ))                     # "5h NN%"
+        [ -n "$five_time" ] && rate=$(( rate + 1 + ${#five_time} ))
+    fi
+    if [ -n "$week_int" ]; then
+        [ "$rate" -gt 0 ] && rate=$(( rate + 3 ))                   # " · "
+        rate=$(( rate + 3 + ${#week_int} + 1 ))
+        [ -n "$week_time" ] && rate=$(( rate + 1 + ${#week_time} ))
+    fi
+    [ "$rate" -gt 0 ] && { w=$(( w + rate )); groups=$(( groups + 1 )); }
+    if [ -n "$xu_str" ]; then
+        w=$(( w + 7 + ${#xu_str} ))                                 # "extra: " amount
+        [ -n "$xu_reset" ] && w=$(( w + 8 + ${#xu_reset} ))         # " resets X"
+        groups=$(( groups + 1 ))
+    fi
+    [ "$groups" -gt 1 ] && w=$(( w + 3 * (groups - 1) ))
+    printf '%s' "$w"
+}
+
+# Cheapest information first: raw token counts duplicate the percentage beside
+# them; the credits reset is derived rather than reported; then the reset times;
+# then the bar narrows. The numbers themselves are the last thing to go.
+[ "$(l2_width)" -gt "$budget" ] && used_k=""
+[ "$(l2_width)" -gt "$budget" ] && xu_reset=""
+[ "$(l2_width)" -gt "$budget" ] && week_time=""
+[ "$(l2_width)" -gt "$budget" ] && five_time=""
+[ "$(l2_width)" -gt "$budget" ] && ctx_bar_w=5
+# Below this the context group goes entirely, before the credits are allowed to
+# fall off the right edge: context self-heals, money does not.
+[ "$(l2_width)" -gt "$budget" ] && ctx_bar_w=0
+[ "$(l2_width)" -gt "$budget" ] && { used_int=""; used_k=""; }
+
+# ── Build line 2 from what survived ──────────────────────────────────────────
+ctx_part=""
+if [ -n "$used_int" ]; then
+    ctx_bar=$(make_bar "$used_int" "$ctx_bar_w" "$CTX_WARN_AT" "$CTX_CRIT_AT")
+    pct_c=$(pct_color "$used_int" "$CTX_WARN_AT" "$CTX_CRIT_AT")
+    ctx_part="${C_MUTED}ctx ${RESET}${ctx_bar} ${pct_c}${used_int}%${RESET}"
+    [ -n "$used_k" ] && ctx_part="${ctx_part} ${C_MUTED}${used_k}${RESET}"
+fi
+
+rate_part=""
+if [ -n "$five_int" ]; then
+    rate_part="${C_MUTED}5h ${RESET}$(pct_color "$five_int")${five_int}%${RESET}"
+    [ -n "$five_time" ] && rate_part="${rate_part} ${C_MUTED}${five_time}${RESET}"
+fi
+if [ -n "$week_int" ]; then
+    [ -n "$rate_part" ] && rate_part="${rate_part}${ITEM_SEP}"
+    rate_part="${rate_part}${C_MUTED}7d ${RESET}$(pct_color "$week_int")${week_int}%${RESET}"
+    [ -n "$week_time" ] && rate_part="${rate_part} ${C_MUTED}${week_time}${RESET}"
+fi
+
+extra_part=""
+if [ -n "$xu_str" ]; then
+    # Coral when a limit is spent: the amount is live and climbing at that
+    # moment, and colour says so without spending a character on it.
+    if [ "$limits_maxed" = 1 ]; then
+        extra_part="${C_MUTED}extra: ${RESET}${C_CRIT}${xu_str}${RESET}"
+    else
+        extra_part="${C_MUTED}extra: ${RESET}${C_VALUE}${xu_str}${RESET}"
+    fi
+    [ -n "$xu_reset" ] && extra_part="${extra_part} ${C_MUTED}resets ${xu_reset}${RESET}"
+fi
 
 # Line 2 — gauges: context window · rate limits · extra usage (far right)
 line2=$(join_sep "$ctx_part" "$rate_part" "$extra_part")
