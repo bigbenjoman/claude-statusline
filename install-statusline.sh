@@ -9,7 +9,7 @@
 #
 # THE STATUS LINE (two lines, grouped by the question you're asking):
 #   line 1 — identity:  model + effort  │  repo[/worktree] ⎇ branch  │  session
-#   line 2 — gauges:    context bar  │  5h · 7d limits  │  extra credits
+#   line 2 — gauges:    context bar · handoff due  │  5h · 7d limits  │  extra credits
 #   Percentages stay muted until elevated, then turn amber / coral — rate limits
 #   at >=60/85%, the context window later (>=75/90%) since it self-heals.
 #   Segments with no data are omitted; if line 2 is empty it collapses to one line.
@@ -100,6 +100,20 @@ let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
   const g=p=>{let v=o;
     for(const k of p.split('.')){if(v&&typeof v==='object')v=v[k];else return ''}
     return (v==null)?'':String(v).replace(/[\r\n]+/g,' ')};
+  // desk's handoff hook keeps per-session state at DESK_HOME/handoff/<id>.json.
+  // Due once fired_at is set, until the file it reserved stops being its placeholder.
+  const handoffDue=()=>{try{
+    const id=String(o.session_id||'').replace(/[^A-Za-z0-9_-]/g,'');if(!id)return '';
+    const fs=require('fs'),os=require('os'),path=require('path');
+    let home=process.env.DESK_HOME||path.join(os.homedir(),'.claude','desk');
+    if(home.startsWith('~'))home=os.homedir()+home.slice(1);
+    const s=JSON.parse(fs.readFileSync(path.join(home,'handoff',id+'.json'),'utf8'));
+    if(!s||!s.fired_at)return '';
+    const mark='<!-- desk handoff placeholder';
+    try{const f=fs.openSync(s.handoff,'r'),b=Buffer.alloc(mark.length);
+      fs.readSync(f,b,0,b.length,0);fs.closeSync(f);
+      return b.toString()===mark?'1':''}catch(e){return '1'}
+  }catch(e){return ''}};
   process.stdout.write([
     'model.display_name','effort.level',
     'context_window.used_percentage','context_window.total_input_tokens',
@@ -107,7 +121,7 @@ let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
     'workspace.repo.name','workspace.project_dir','cwd','session_name',
     'rate_limits.five_hour.used_percentage','rate_limits.five_hour.resets_at',
     'rate_limits.seven_day.used_percentage','rate_limits.seven_day.resets_at',
-  ].map(g).join('\n'));
+  ].map(g).concat(handoffDue()).join('\n'));
 });
 " 2>/dev/null
 }
@@ -120,6 +134,7 @@ let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
   read -r session_name
   read -r five_pct    ; read -r five_resets
   read -r week_pct    ; read -r week_resets
+  read -r handoff_due
 } <<< "$(read_fields)"
 
 # ── Severity thresholds ───────────────────────────────────────────────────────
@@ -544,7 +559,10 @@ l2_width() {
         # you get "ctx  50%" with a hole in it.
         [ "$ctx_bar_w" -gt 0 ] && w=$(( w + ctx_bar_w + 1 ))
         [ -n "$used_k" ] && w=$(( w + 1 + ${#used_k} ))
+        [ -n "$handoff_due" ] && w=$(( w + 14 ))                   # " · handoff due"
         groups=$(( groups + 1 ))
+    elif [ -n "$handoff_due" ]; then
+        w=$(( w + 11 )); groups=$(( groups + 1 ))                  # "handoff due"
     fi
     local rate=0
     if [ -n "$five_int" ]; then
@@ -592,6 +610,12 @@ if [ -n "$used_int" ]; then
     fi
     ctx_part="${ctx_part}${pct_c}${used_int}%${RESET}"
     [ -n "$used_k" ] && ctx_part="${ctx_part} ${C_MUTED}${used_k}${RESET}"
+fi
+# Not on the fit ladder: it outlives the context group, because it is the one
+# thing on this line that asks you to act.
+if [ -n "$handoff_due" ]; then
+    [ -n "$ctx_part" ] && ctx_part="${ctx_part}${ITEM_SEP}"
+    ctx_part="${ctx_part}${C_WARN}handoff due${RESET}"
 fi
 
 rate_part=""

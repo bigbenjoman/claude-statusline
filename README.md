@@ -17,7 +17,7 @@ ctx ██▒▒▒▒▒▒▒▒ 6% 69k/1M │ 5h 25% 14:27 · 7d 12% Jul 4 12
 Two lines, grouped by the question you're actually asking at a glance:
 
 - **Line 1 — identity:** model + reasoning effort · location, as `repo` or `repo/worktree`, then the branch · session name
-- **Line 2 — gauges:** context-window usage · 5-hour and 7-day rate limits with reset times · extra-usage credits
+- **Line 2 — gauges:** context-window usage, plus **handoff due** in amber when [desk](https://github.com/bigbenjoman/desk-skills)'s handoff threshold has fired and the handoff is not written yet · 5-hour and 7-day rate limits with reset times · extra-usage credits
 
 Percentages stay muted until they matter, then turn **amber** and **coral** — so an idle bar is calm and a stressed one grabs your eye. Rate limits ramp at **≥60% / ≥85%**; the context window ramps later (**≥75% / ≥90%**) because it self-heals through compaction, while a spent rate limit locks you out for days. All times are 24-hour.
 
@@ -56,7 +56,7 @@ Claude Code truncates an over-long status line at the right edge, so whatever si
 
 **Line 1** sacrifices in this order: session name to 28 chars → to 20 → branch → effort → session name entirely → worktree to 12 → the model's `(1M context)` qualifier → the model name. The location is never dropped; it is what a glance is *for* when several sessions are open on one repo.
 
-**Line 2**: raw token counts (they duplicate the percentage beside them) → the credits reset date (derived, not reported) → the 7-day reset → the 5-hour reset → the bar narrows to 5 cells → the bar goes → the whole context group goes. Credits are last, because context self-heals and money does not.
+**Line 2**: raw token counts (they duplicate the percentage beside them) → the credits reset date (derived, not reported) → the 7-day reset → the 5-hour reset → the bar narrows to 5 cells → the bar goes → the whole context group goes. Credits are last, because context self-heals and money does not. **handoff due** is never dropped: it is the one thing on the line that asks you to act.
 
 ## Diagnostics
 
@@ -118,6 +118,7 @@ From the status line's stdin JSON:
 | `session_name` | session |
 | `context_window.*` | context bar |
 | `rate_limits.five_hour.*`, `rate_limits.seven_day.*` | rate-limit gauges + reset times; either at 100% also raises the credits alarm |
+| `session_id` | handoff due: names desk's per-session state file, `$DESK_HOME/handoff/<session_id>.json` (default `~/.claude/desk`); with no such file the segment is absent |
 
 Plus `$COLUMNS` from the environment (falling back to `tput cols`) to fit both lines to the terminal.
 
